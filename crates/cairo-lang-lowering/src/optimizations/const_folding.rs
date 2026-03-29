@@ -880,6 +880,144 @@ impl<'db, 'mt> ConstFoldingContext<'db, 'mt> {
         }
     }
 
+    /// Tries to materialize `var_info` into `output`.
+    ///
+    /// Returns `None` if the value cannot be materialized with lowering statements.
+    fn try_materialize_var_info(
+        &mut self,
+        var_info: Rc<VarInfo<'db>>,
+        output: VariableId,
+        location: crate::ids::LocationId<'db>,
+        statements: &mut Vec<Statement<'db>>,
+    ) -> Option<()> {
+        let db = self.db;
+        let as_usage = |var_id| VarUsage { var_id, location };
+        match var_info.as_ref() {
+            VarInfo::Const(value) => {
+                statements.push(self.try_generate_const_statement(*value, output)?);
+                Some(())
+            }
+            VarInfo::Snapshot(inner) => {
+                let inner_ty =
+                    *extract_matches!(self.variables[output].ty.long(db), TypeLongId::Snapshot);
+                let inner_output =
+                    self.variables.alloc(Variable::with_default_context(db, inner_ty, location));
+                self.try_materialize_var_info(inner.clone(), inner_output, location, statements)?;
+                let ignored = self.variables.alloc(self.variables[inner_output].clone());
+                statements.push(Statement::Snapshot(StatementSnapshot::new(
+                    as_usage(inner_output),
+                    ignored,
+                    output,
+                )));
+                Some(())
+            }
+            VarInfo::Struct(member_infos) => {
+                let member_tys = match self.variables[output].ty.long(db) {
+                    TypeLongId::Concrete(ConcreteTypeId::Struct(concrete_struct)) => {
+                        let members = self.db.concrete_struct_members(*concrete_struct).unwrap();
+                        members.values().map(|member| member.ty).collect()
+                    }
+                    TypeLongId::Tuple(member_tys) => member_tys.clone(),
+                    TypeLongId::FixedSizeArray { type_id, .. } => {
+                        vec![*type_id; member_infos.len()]
+                    }
+                    _ => return None,
+                };
+                let mut inputs = Vec::with_capacity(member_infos.len());
+                for (member_ty, member_info) in zip_eq(member_tys, member_infos) {
+                    let member_info = member_info.as_ref()?.clone();
+                    let member_output = self
+                        .variables
+                        .alloc(Variable::with_default_context(db, member_ty, location));
+                    self.try_materialize_var_info(
+                        member_info,
+                        member_output,
+                        location,
+                        statements,
+                    )?;
+                    inputs.push(as_usage(member_output));
+                }
+                statements
+                    .push(Statement::StructConstruct(StatementStructConstruct { inputs, output }));
+                Some(())
+            }
+            VarInfo::Box(inner) => {
+                let TypeLongId::Concrete(concrete_ty) = self.variables[output].ty.long(db) else {
+                    return None;
+                };
+                let [GenericArgumentId::Type(inner_ty)] = &concrete_ty.generic_args(db)[..] else {
+                    return None;
+                };
+                let inner_output =
+                    self.variables.alloc(Variable::with_default_context(db, *inner_ty, location));
+                self.try_materialize_var_info(inner.clone(), inner_output, location, statements)?;
+                statements.push(Statement::IntoBox(StatementIntoBox {
+                    input: as_usage(inner_output),
+                    output,
+                }));
+                Some(())
+            }
+            VarInfo::Array(element_infos) => {
+                let TypeLongId::Concrete(concrete_ty) = self.variables[output].ty.long(db) else {
+                    return None;
+                };
+                let [GenericArgumentId::Type(inner_ty)] = &concrete_ty.generic_args(db)[..] else {
+                    return None;
+                };
+                let array_fn = |extern_id| {
+                    GenericFunctionId::Extern(extern_id)
+                        .concretize(db, vec![GenericArgumentId::Type(*inner_ty)])
+                        .lowered(db)
+                };
+                let call_stmt = |function, inputs, outputs| {
+                    Statement::Call(StatementCall {
+                        function,
+                        inputs,
+                        with_coupon: false,
+                        outputs,
+                        location,
+                        is_specialization_base_call: false,
+                    })
+                };
+
+                if element_infos.is_empty() {
+                    statements.push(call_stmt(array_fn(self.array_new), vec![], vec![output]));
+                    return Some(());
+                }
+
+                let arr_ty = self.variables[output].ty;
+                let mut arr =
+                    self.variables.alloc(Variable::with_default_context(db, arr_ty, location));
+                statements.push(call_stmt(array_fn(self.array_new), vec![], vec![arr]));
+                for (index, element_info) in element_infos.iter().enumerate() {
+                    let element_info = element_info.as_ref()?.clone();
+                    let element_output = self
+                        .variables
+                        .alloc(Variable::with_default_context(db, *inner_ty, location));
+                    self.try_materialize_var_info(
+                        element_info,
+                        element_output,
+                        location,
+                        statements,
+                    )?;
+                    let next_arr = if index + 1 == element_infos.len() {
+                        output
+                    } else {
+                        self.variables.alloc(Variable::with_default_context(db, arr_ty, location))
+                    };
+                    statements.push(call_stmt(
+                        array_fn(self.array_append),
+                        vec![as_usage(arr), as_usage(element_output)],
+                        vec![next_arr],
+                    ));
+                    arr = next_arr;
+                }
+                Some(())
+            }
+            VarInfo::Var(_) | VarInfo::Enum { .. } => None,
+        }
+    }
+
     /// Handles the end of block matching on an enum.
     /// Possibly extends the blocks statements as well.
     /// Returns None if no additional changes are required.
@@ -1336,13 +1474,36 @@ impl<'db, 'mt> ConstFoldingContext<'db, 'mt> {
                 element_var_infos.split_last().map(|(last, rest)| (last.clone(), rest.to_vec()))
             } {
                 let arm = &info.arms[0];
-                self.var_info
-                    .insert(arm.var_ids[0], wrap_snapshot_array(remaining_var_infos).into());
+                let remaining_info: Rc<VarInfo<'db>> =
+                    wrap_snapshot_array(remaining_var_infos).into();
+                self.var_info.insert(arm.var_ids[0], remaining_info.clone());
                 if let Some(element_var_info) = element_var_info {
-                    self.var_info.insert(
-                        arm.var_ids[1],
-                        VarInfo::Box(VarInfo::Snapshot(element_var_info).into()).into(),
-                    );
+                    let popped_info: Rc<VarInfo<'db>> =
+                        VarInfo::Box(VarInfo::Snapshot(element_var_info).into()).into();
+                    self.var_info.insert(arm.var_ids[1], popped_info.clone());
+                    if self.variables[info.inputs[0].var_id].info.droppable.is_ok() {
+                        let mut materialized_stmts = vec![];
+                        if self
+                            .try_materialize_var_info(
+                                remaining_info,
+                                arm.var_ids[0],
+                                info.location,
+                                &mut materialized_stmts,
+                            )
+                            .is_some()
+                            && self
+                                .try_materialize_var_info(
+                                    popped_info,
+                                    arm.var_ids[1],
+                                    info.location,
+                                    &mut materialized_stmts,
+                                )
+                                .is_some()
+                        {
+                            statements.extend(materialized_stmts);
+                            return Some(BlockEnd::Goto(arm.block_id, Default::default()));
+                        }
+                    }
                 }
                 None
             } else {
